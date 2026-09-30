@@ -5,14 +5,16 @@
 
 #include <Python.h>
 
-// Include Sample class header to enable calling functions from Sample.cpp
-#include "sample.hpp"
+// Pyroscope patch: use the Rust-backed Pyroscope sample adapter instead of
+// Datadog's sample.hpp implementation.
+#include "Pyroscope.h"
 
 class traceback_t
 {
   public:
-    /* Sample object storing the stacktrace */
-    Datadog::Sample sample;
+    /* Pyroscope patch: store samples in the Pyroscope adapter so exports are
+     * forwarded to the Rust profile builder. */
+    Pyroscope::Sample sample;
 
     /* Constructor - also collects frames from the current Python frame chain. */
     traceback_t(size_t size, size_t weighted_size, uint16_t max_nframe);

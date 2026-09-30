@@ -14,22 +14,11 @@
 #include "_memalloc_tb.h"
 #include "_pymacro.h"
 
-/* Use Abseil's flat_hash_map for tracking sampled allocations.
- * flat_hash_map provides excellent performance with low memory overhead,
- * using the Swiss Tables algorithm from Abseil.
- *
- * We use a conditional compilation to fall back to std::unordered_map
- * when Abseil is not available (e.g., in Debug builds).
- */
-#if defined(NDEBUG) && !defined(DONT_COMPILE_ABSEIL)
+// Pyroscope patch: Pyroscope's CMake build always provides Abseil, including
+// debug builds, so use the same heap-map implementation in every build mode.
 #include "absl/container/flat_hash_map.h"
 template<typename K, typename V>
 using HeapMapType = absl::flat_hash_map<K, V>;
-#else
-#include <unordered_map>
-template<typename K, typename V>
-using HeapMapType = std::unordered_map<K, V>;
-#endif // defined(NDEBUG) && !defined(DONT_COMPILE_ABSEIL)
 
 /*
    How heap profiler sampling works:
@@ -208,8 +197,18 @@ heap_tracker_t::next_sample_size_no_cpython(uint32_t sample_size)
        NOTE: std::exponential_distribution calls log internally. log is not
        listed as async-signal-safe by POSIX, but does not use locks in practice.
        We assume it is safe to call from heap_tracker_t::postfork_child. */
-    std::exponential_distribution<double> dist(1.0 / (sample_size + 1));
-    return static_cast<uint32_t>(dist(rng));
+
+    /* Pyroscope patch: widen to double before adding 1 so sample_size == UINT32_MAX
+       cannot wrap the 32-bit addition to zero (which would make the rate infinite). */
+    std::exponential_distribution<double> dist(1.0 / (static_cast<double>(sample_size) + 1.0));
+    /* Pyroscope patch: clamp before the cast. Converting a double >= 2^32 to uint32_t
+       is UB, and the exponential distribution has unbounded support, so large draws
+       are expected for large sampling intervals. */
+    double draw = dist(rng);
+    if (draw >= static_cast<double>(UINT32_MAX)) {
+        return UINT32_MAX;
+    }
+    return static_cast<uint32_t>(draw);
 }
 
 // Method implementations
@@ -286,7 +285,9 @@ heap_tracker_t::export_heap_no_cpython()
         tb->sample.export_sample();
     }
 
-    Datadog::Sample::profile_borrow().stats().set_heap_tracker_size(allocs_m.size());
+    // Pyroscope patch: heap samples are exported through the Rust profile
+    // builder, which has no Datadog profile-state statistics object.
+    // Datadog::Sample::profile_borrow().stats().set_heap_tracker_size(allocs_m.size());
 }
 
 void
@@ -411,6 +412,10 @@ memalloc_heap_track_invokes_cpython(uint16_t max_nframe, void* ptr, size_t size,
     auto tb =
       heap_tracker_t::instance->pool_get_with_alloc_data_invokes_cpython(size, allocated_memory_val, max_nframe);
 
+    // Pyroscope patch: carry the sampling-scaled allocation count over to the
+    // heap (inuse) values before reset_alloc discards it, so live samples
+    // report inuse_objects with the same estimate that alloc_objects used.
+    size_t scaled_count = tb->sample.alloc_count();
     // Export allocation sample right away to avoid holding it
     tb->sample.export_sample();
     // Reset the allocation data, keep heap data for tracking
@@ -420,7 +425,8 @@ memalloc_heap_track_invokes_cpython(uint16_t max_nframe, void* ptr, size_t size,
     // Use the weighted size (allocated_memory_val) so the heap profile accounts
     // for sampling, matching the tcmalloc/Go pprof approach: each sampled live
     // allocation represents ~R bytes of heap, not just its own raw size.
-    tb->sample.push_heap(allocated_memory_val);
+    // Pyroscope patch: also pass the scaled count so dumps report inuse_objects.
+    tb->sample.push_heap(allocated_memory_val, scaled_count);
 
     // Check that instance is still valid after GIL release in constructor
     if (heap_tracker_t::instance) {
